@@ -1,7 +1,7 @@
 # Dockerfile for Telegram Auto-Forward Bot
 # Build: docker build -t telegram-autoforward-bot .
 # Run: docker run -d --name autoforward-bot \
-#      -e BOT_TOKEN=xxx -e API_ID=xxx -e API_HASH=xxx \
+#      -e TELEGRAM_API_ID=xxx -e TELEGRAM_API_HASH=xxx -e TELEGRAM_BOT_TOKEN=xxx \
 #      -v bot_data:/app/data telegram-autoforward-bot
 
 FROM python:3.11-slim
@@ -29,8 +29,8 @@ RUN mkdir -p /app/data /app/sessions
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV DATA_DIR=/app/data
 ENV SESSION_DIR=/app/sessions
+ENV DATABASE_FILE=/app/data/autoforward.db
 
 # Volume for persistent data
 VOLUME ["/app/data", "/app/sessions"]
@@ -52,9 +52,9 @@ CMD ["python", "multiuser_autoforward_bot.py"]
 #     container_name: telegram-autoforward-bot
 #     restart: unless-stopped
 #     environment:
-#       - BOT_TOKEN=${BOT_TOKEN}
-#       - API_ID=${API_ID}
-#       - API_HASH=${API_HASH}
+#       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+#       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+#       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 #     volumes:
 #       - bot_data:/app/data
 #       - bot_sessions:/app/sessions
