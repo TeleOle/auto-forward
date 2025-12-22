@@ -21,8 +21,8 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY multiuser_autoforward_bot.py .
+# Copy all Python files (handles different naming)
+COPY *.py .
 
 # Create data directory for SQLite and sessions
 RUN mkdir -p /app/data /app/sessions
@@ -35,30 +35,9 @@ ENV DATABASE_FILE=/app/data/autoforward.db
 # Volume for persistent data
 VOLUME ["/app/data", "/app/sessions"]
 
-# Health check (optional)
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Run the bot
-CMD ["python", "multiuser_autoforward_bot.py"]
-
-# ============================================
-# Docker Compose (save as docker-compose.yml)
-# ============================================
-# version: '3.8'
-# services:
-#   bot:
-#     build: .
-#     container_name: telegram-autoforward-bot
-#     restart: unless-stopped
-#     environment:
-#       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
-#       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
-#       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-#     volumes:
-#       - bot_data:/app/data
-#       - bot_sessions:/app/sessions
-# 
-# volumes:
-#   bot_data:
-#   bot_sessions:
+# Run the bot (try different filenames)
+CMD ["sh", "-c", "python multiuser_autoforward_bot.py || python bot.py || python main.py"]
