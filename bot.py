@@ -140,21 +140,109 @@ except ImportError:
     ContextTypes = None
     BadRequest = Exception
 
-# ==================== CONFIGURATION ====================
-API_ID = int(os.getenv('TELEGRAM_API_ID', '0'))
-API_HASH = os.getenv('TELEGRAM_API_HASH', '0')
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '0')
-
-SESSION_DIR = "user_sessions"
-DATABASE_FILE = "autoforward.db"
-
-os.makedirs(SESSION_DIR, exist_ok=True)
-
+# ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 log = logging.getLogger(__name__)
+
+# ==================== CONFIGURATION ====================
+class Config:
+    """
+    Configuration loaded from environment variables.
+    Set these environment variables before running:
+    - TELEGRAM_API_ID      : Your Telegram API ID from my.telegram.org
+    - TELEGRAM_API_HASH    : Your Telegram API Hash from my.telegram.org
+    - TELEGRAM_BOT_TOKEN   : Bot token from @BotFather
+    - ADMIN_USER_ID        : (Optional) Admin user ID for special permissions
+    - SESSION_DIR          : (Optional) Directory for session files
+    - DATABASE_FILE        : (Optional) SQLite database file path
+    """
+    # Required settings
+    API_ID: int = int(os.getenv('TELEGRAM_API_ID', '0'))
+    API_HASH: str = os.getenv('TELEGRAM_API_HASH', '')
+    BOT_TOKEN: str = os.getenv('TELEGRAM_BOT_TOKEN', os.getenv('MANAGER_BOT_TOKEN', ''))
+    
+    # Optional settings
+    ADMIN_USER_ID: int = int(os.getenv('ADMIN_USER_ID', '0'))
+    SESSION_DIR: str = os.getenv('SESSION_DIR', 'user_sessions')
+    DATABASE_FILE: str = os.getenv('DATABASE_FILE', 'autoforward.db')
+    
+    # Bot settings
+    MAX_RULES_PER_USER: int = int(os.getenv('MAX_RULES_PER_USER', '50'))
+    MAX_ACCOUNTS_PER_USER: int = int(os.getenv('MAX_ACCOUNTS_PER_USER', '10'))
+    
+    @classmethod
+    def validate(cls) -> bool:
+        """Validate that all required configuration is present."""
+        errors = []
+        
+        if not cls.API_ID or cls.API_ID == 0:
+            errors.append("TELEGRAM_API_ID is required")
+        
+        if not cls.API_HASH:
+            errors.append("TELEGRAM_API_HASH is required")
+        
+        if not cls.BOT_TOKEN:
+            errors.append("TELEGRAM_BOT_TOKEN is required")
+        
+        if errors:
+            log.error("❌ Configuration errors:")
+            for err in errors:
+                log.error(f"   - {err}")
+            log.error("")
+            log.error("Please set environment variables or create a .env file:")
+            log.error("   export TELEGRAM_API_ID=your_api_id")
+            log.error("   export TELEGRAM_API_HASH=your_api_hash")
+            log.error("   export TELEGRAM_BOT_TOKEN=your_bot_token")
+            return False
+        
+        log.info("✅ Configuration loaded successfully")
+        log.info(f"   - API_ID: {cls.API_ID}")
+        log.info(f"   - API_HASH: {cls.API_HASH[:8]}...")
+        log.info(f"   - BOT_TOKEN: {cls.BOT_TOKEN[:20]}...")
+        log.info(f"   - SESSION_DIR: {cls.SESSION_DIR}")
+        log.info(f"   - DATABASE_FILE: {cls.DATABASE_FILE}")
+        
+        if cls.ADMIN_USER_ID:
+            log.info(f"   - ADMIN_USER_ID: {cls.ADMIN_USER_ID}")
+        
+        return True
+    
+    @classmethod
+    def load_dotenv(cls):
+        """Load configuration from .env file if python-dotenv is available."""
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            # Reload values after loading .env
+            cls.API_ID = int(os.getenv('TELEGRAM_API_ID', '0'))
+            cls.API_HASH = os.getenv('TELEGRAM_API_HASH', '')
+            cls.BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', os.getenv('MANAGER_BOT_TOKEN', ''))
+            cls.ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0'))
+            cls.SESSION_DIR = os.getenv('SESSION_DIR', 'user_sessions')
+            cls.DATABASE_FILE = os.getenv('DATABASE_FILE', 'autoforward.db')
+            cls.MAX_RULES_PER_USER = int(os.getenv('MAX_RULES_PER_USER', '50'))
+            cls.MAX_ACCOUNTS_PER_USER = int(os.getenv('MAX_ACCOUNTS_PER_USER', '10'))
+            log.info("✅ Loaded .env file")
+        except ImportError:
+            log.debug("python-dotenv not installed, skipping .env file")
+        except Exception as e:
+            log.warning(f"Failed to load .env file: {e}")
+
+# Load .env file if available
+Config.load_dotenv()
+
+# Create session directory
+os.makedirs(Config.SESSION_DIR, exist_ok=True)
+
+# Backward compatibility aliases
+API_ID = Config.API_ID
+API_HASH = Config.API_HASH
+BOT_TOKEN = Config.BOT_TOKEN
+SESSION_DIR = Config.SESSION_DIR
+DATABASE_FILE = Config.DATABASE_FILE
 
 # ==================== HELPER FUNCTIONS ====================
 def parse_multi_ids(text: str) -> List[str]:
@@ -3596,21 +3684,54 @@ async def on_shutdown(app):
 
 # ==================== MAIN ====================
 def main():
+    """Main entry point for the bot."""
+    # Check dependencies
     if not TELEGRAM_AVAILABLE:
-        print("❌ Install: pip install python-telegram-bot")
+        print("❌ python-telegram-bot not installed!")
+        print("   Install: pip install python-telegram-bot")
         return 1
     
     if not TELETHON_AVAILABLE:
-        print("⚠️ Install telethon for forwarding: pip install telethon")
+        print("⚠️ Telethon not installed - forwarding features disabled")
+        print("   Install: pip install telethon")
     
-    app = (ApplicationBuilder()
-           .token(BOT_TOKEN)
-           .post_init(on_startup)
-           .post_shutdown(on_shutdown)
-           .build())
+    # Validate configuration
+    if not Config.validate():
+        print("")
+        print("=" * 50)
+        print("Configuration Error!")
+        print("=" * 50)
+        print("")
+        print("Please set the required environment variables:")
+        print("")
+        print("  Option 1: Export variables")
+        print("    export TELEGRAM_API_ID=your_api_id")
+        print("    export TELEGRAM_API_HASH=your_api_hash")
+        print("    export TELEGRAM_BOT_TOKEN=your_bot_token")
+        print("")
+        print("  Option 2: Create .env file")
+        print("    TELEGRAM_API_ID=your_api_id")
+        print("    TELEGRAM_API_HASH=your_api_hash")
+        print("    TELEGRAM_BOT_TOKEN=your_bot_token")
+        print("")
+        print("Get API credentials from: https://my.telegram.org")
+        print("Get bot token from: @BotFather on Telegram")
+        print("")
+        return 1
     
+    # Build application
+    try:
+        app = (ApplicationBuilder()
+               .token(Config.BOT_TOKEN)
+               .post_init(on_startup)
+               .post_shutdown(on_shutdown)
+               .build())
+    except Exception as e:
+        log.error(f"❌ Failed to create bot application: {e}")
+        return 1
+    
+    # Add handlers
     app.add_error_handler(error_handler)
-    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("rules", cmd_rules))
@@ -3618,17 +3739,21 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    log.info("🤖 Starting polling...")
+    log.info("=" * 50)
+    log.info("🤖 Telegram Auto-Forward Bot")
+    log.info("=" * 50)
+    log.info("🚀 Starting polling...")
     
     try:
         app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
-        pass
+        log.info("👋 Bot stopped by user")
     except Exception as e:
-        log.exception("Crashed")
+        log.exception(f"❌ Bot crashed: {e}")
         return 1
     
     return 0
+
 
 if __name__ == '__main__':
     import sys
