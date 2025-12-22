@@ -43,9 +43,24 @@ cp .env.example .env
 python multiuser_autoforward_bot.py
 ```
 
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_API_ID` | ✅ | API ID from my.telegram.org |
+| `TELEGRAM_API_HASH` | ✅ | API Hash from my.telegram.org |
+| `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
+| `ADMIN_USER_ID` | ❌ | Admin user ID for special permissions |
+| `SESSION_DIR` | ❌ | Directory for session files (default: user_sessions) |
+| `DATABASE_FILE` | ❌ | SQLite database path (default: autoforward.db) |
+
 ### Docker Deployment
 
 ```bash
+# Create .env file with your credentials
+cp .env.example .env
+# Edit .env
+
 # Build and run
 docker-compose up -d
 
@@ -62,16 +77,18 @@ docker-compose down
 2. Connect to [Render](https://render.com)
 3. Create new "Background Worker"
 4. Set environment variables:
-   - `BOT_TOKEN`
-   - `API_ID`
-   - `API_HASH`
+   - `TELEGRAM_API_ID`
+   - `TELEGRAM_API_HASH`
+   - `TELEGRAM_BOT_TOKEN`
 5. Deploy!
 
 ### Deploy to Heroku
 
 ```bash
 heroku create your-bot-name
-heroku config:set BOT_TOKEN=xxx API_ID=xxx API_HASH=xxx
+heroku config:set TELEGRAM_API_ID=xxx
+heroku config:set TELEGRAM_API_HASH=xxx
+heroku config:set TELEGRAM_BOT_TOKEN=xxx
 git push heroku main
 heroku ps:scale worker=1
 ```
@@ -91,7 +108,7 @@ heroku ps:scale worker=1
 | `/start` | Main menu |
 | `/help` | Help information |
 | `/rules` | View your rules |
-| `/accounts` | Manage accounts |
+| `/status` | Bot status |
 
 ## 🔧 Configuration Options
 
@@ -128,7 +145,8 @@ heroku ps:scale worker=1
 ├── render.yaml                   # Render deployment
 ├── Procfile                      # Heroku deployment
 ├── .env.example                  # Environment template
-└── .gitignore                    # Git ignore rules
+├── .gitignore                    # Git ignore rules
+└── README.md                     # This file
 ```
 
 ## ⚠️ Important Notes
@@ -136,6 +154,7 @@ heroku ps:scale worker=1
 - **Session Security**: Never share `.session` files - they contain auth tokens
 - **Rate Limits**: Telegram has rate limits; don't forward too frequently
 - **Storage**: Use persistent storage for database and sessions in production
+- **Config Validation**: Bot validates config on startup and shows helpful errors
 
 ## 📄 License
 
