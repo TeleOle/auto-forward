@@ -3757,4 +3757,6 @@ def main():
 
 if __name__ == '__main__':
     import sys
+    from keep_alive import keep_alive
+    keep_alive()
     sys.exit(main())

@@ -20,3 +20,13 @@ python-dotenv==1.0.1
 # HTTP client
 aiohttp>=3.9.0
 httpx>=0.25.0
+flask
+aiohttp
+aiosqlite
+asyncio-throttle
+cryptography
+httpx
+pyaes
+python-dotenv
+python-telegram-bot
+telethon
