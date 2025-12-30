@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Multi-User Telegram Auto-Forward Bot
 =====================================
@@ -6,6 +8,9 @@ Features:
 - Multiple destinations per rule (comma-separated)
 - Per-user session management
 - SQLite database storage
+- Large file support (up to 2GB) with MTProto optimization
+- Progress tracking for downloads/uploads (files > 10MB)
+- Automatic chunking and optimized transfer
 """
 
 import asyncio
@@ -55,17 +60,19 @@ DEFAULT_FILTERS = {
     'emoji': False,         # Ignore animated emoji
     'forward': False,       # Ignore forwarded messages
     'reply': False,         # Ignore reply messages
-    'link': False,          # Ignore messages with links
     'button': False,        # Ignore messages with buttons
     
     # Cleaner options (remove from caption)
-    'clean_caption': False,   # Remove entire caption (hide caption)
+    'clean_caption': False,   # Remove all captions - forward media without any caption text
     'clean_hashtag': False,   # Remove #hashtags from caption
     'clean_mention': False,   # Remove @mentions from caption
     'clean_link': False,      # Remove links from caption
     'clean_emoji': False,     # Remove emojis from caption
     'clean_phone': False,     # Remove phone numbers from caption
     'clean_email': False,     # Remove email addresses from caption
+
+    # Media effect options
+    'apply_spoiler': False,   # Apply spoiler effect to photos and videos (blurred, shimmering layer)
 }
 
 # Default modify content configuration
@@ -73,34 +80,53 @@ DEFAULT_MODIFY = {
     # Filename rename
     'rename_enabled': False,
     'rename_pattern': '{original}',  # Patterns: {original}, {date}, {time}, {random}, {counter}
-    
+
     # Block/Whitelist words
     'block_words_enabled': False,
     'block_words': [],  # List of words to block (message skipped if contains)
     'whitelist_enabled': False,
     'whitelist_words': [],  # List of words required (message skipped if NOT contains)
-    
+
     # Word replacement
     'replace_enabled': False,
     'replace_pairs': [],  # List of {'from': 'old', 'to': 'new', 'regex': False}
-    
+
     # Caption editing
     'header_enabled': False,
     'header_text': '',  # Text to add at the beginning
     'footer_enabled': False,
     'footer_text': '',  # Text to add at the end
-    
+
     # Link buttons
     'buttons_enabled': False,
     'buttons': [],  # List of [{'text': 'Button', 'url': 'https://...'}] per row
-    
+
     # Delay
     'delay_enabled': False,
     'delay_seconds': 0,  # Delay in seconds before forwarding
-    
+
     # History
     'history_enabled': False,
     'history_count': 0,  # Number of past messages to forward when rule created
+
+    # Watermark
+    'watermark_enabled': False,
+    'watermark_type': 'text',  # 'text' or 'logo'
+
+    # Text watermark settings
+    'watermark_text': '',
+    'watermark_text_color': 'white',  # white, black, blue, red, or custom hex
+    'watermark_text_custom_color': '#FFFFFF',
+
+    # Logo watermark settings
+    'watermark_logo_file_id': None,  # Telegram file_id of the logo image
+    'watermark_logo_path': None,  # Local path to logo (temporary storage)
+
+    # Common watermark settings (both text and logo)
+    'watermark_position': 'bottom-right',  # top-left, top, top-right, left, center, right, bottom-left, bottom, bottom-right
+    'watermark_opacity': 50,  # 10-100%
+    'watermark_rotation': 0,  # 0-359 degrees
+    'watermark_size': 10,  # 10-100% (for text: font size, for logo: scale)
 }
 
 # Optional dependency handling
@@ -266,6 +292,343 @@ def format_id_list(ids: List[str], max_show: int = 3) -> str:
         return ', '.join(f'`{i}`' for i in ids)
     return ', '.join(f'`{i}`' for i in ids[:max_show]) + f' +{len(ids)-max_show} more'
 
+# ==================== WATERMARK PROCESSING ====================
+def apply_watermark_with_ffmpeg(input_path: str, output_path: str, watermark_config: dict, is_video: bool = False) -> bool:
+    """
+    Apply watermark to image or video using FFmpeg (preferred method).
+
+    Args:
+        input_path: Path to input file (image or video)
+        output_path: Path to save watermarked file
+        watermark_config: Dictionary with watermark settings
+        is_video: True if input is video, False if image
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        import subprocess
+        import os
+
+        media_type = "video" if is_video else "image"
+        log.info(f"🎬 FFmpeg Watermark: Processing {media_type}: {input_path}")
+
+        watermark_type = watermark_config.get('watermark_type', 'text')
+        position = watermark_config.get('watermark_position', 'bottom-right')
+        opacity = watermark_config.get('watermark_opacity', 50) / 100.0
+        size_percent = watermark_config.get('watermark_size', 10)
+
+        log.info(f"🎬 FFmpeg Watermark: type={watermark_type}, position={position}, opacity={opacity}, size={size_percent}%")
+
+        # Position mapping for FFmpeg
+        position_map = {
+            'top-left': 'x=10:y=10',
+            'top': 'x=(W-w)/2:y=10',
+            'top-right': 'x=W-w-10:y=10',
+            'left': 'x=10:y=(H-h)/2',
+            'center': 'x=(W-w)/2:y=(H-h)/2',
+            'right': 'x=W-w-10:y=(H-h)/2',
+            'bottom-left': 'x=10:y=H-h-10',
+            'bottom': 'x=(W-w)/2:y=H-h-10',
+            'bottom-right': 'x=W-w-10:y=H-h-10',
+        }
+        pos_string = position_map.get(position, 'x=W-w-10:y=H-h-10')
+
+        if watermark_type == 'text':
+            text = watermark_config.get('watermark_text', '')
+            if not text:
+                log.error("🎬 FFmpeg Watermark FAILED: No watermark text provided")
+                return False
+
+            log.info(f"🎬 FFmpeg Watermark: Adding text '{text[:30]}...'")
+
+            color_name = watermark_config.get('watermark_text_color', 'white')
+            color_map = {
+                'white': 'white',
+                'black': 'black',
+                'blue': 'blue',
+                'red': 'red'
+            }
+            color = color_map.get(color_name, 'white')
+
+            # Escape special characters for FFmpeg
+            text = text.replace("'", "\\'").replace(":", "\\:")
+
+            # Build FFmpeg filter for text watermark
+            font_size = f"fontsize=h*{size_percent}/100"
+            filter_str = f"drawtext=text='{text}':{pos_string}:fontcolor={color}@{opacity}:{font_size}"
+
+            # For images, we need to specify output format
+            if is_video:
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-vf', filter_str,
+                    '-codec:a', 'copy',
+                    '-y',  # Overwrite output file
+                    output_path
+                ]
+            else:
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-vf', filter_str,
+                    '-frames:v', '1',  # Write only one frame
+                    '-update', '1',    # Allow overwriting single image
+                    '-y',  # Overwrite output file
+                    output_path
+                ]
+
+        else:  # logo watermark
+            logo_path = watermark_config.get('watermark_logo_path')
+            if not logo_path or not os.path.exists(logo_path):
+                log.error(f"🎬 FFmpeg Watermark FAILED: Logo not found at {logo_path}")
+                return False
+
+            log.info(f"🎬 FFmpeg Watermark: Adding logo from {logo_path}")
+
+            # Build FFmpeg filter for logo overlay - extract first frame from logo if it's a video
+            scale = f"scale=iw*{size_percent}/100:-1"
+            filter_str = f"[1:v]{scale},format=rgba,colorchannelmixer=aa={opacity}[wm];[0:v][wm]overlay={pos_string}"
+
+            # For images, we need to specify output format
+            if is_video:
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-i', logo_path,
+                    '-filter_complex', filter_str,
+                    '-codec:a', 'copy',
+                    '-y',  # Overwrite output file
+                    output_path
+                ]
+            else:
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-i', logo_path,
+                    '-filter_complex', filter_str,
+                    '-frames:v', '1',  # Write only one frame
+                    '-update', '1',    # Allow overwriting single image
+                    '-y',  # Overwrite output file
+                    output_path
+                ]
+
+        # Run FFmpeg
+        log.info(f"🎬 FFmpeg Watermark: Running command")
+        log.info(f"🎬 FFmpeg Watermark: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode == 0:
+            log.info(f"🎬 FFmpeg Watermark: ✅ {media_type.capitalize()} watermark completed successfully")
+            return True
+        else:
+            log.error(f"❌ FFmpeg error (returncode={result.returncode}): {result.stderr}")
+            return False
+
+    except FileNotFoundError:
+        log.warning("⚠️ FFmpeg not installed. Will try Pillow for images.")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("❌ FFmpeg timeout (60s exceeded)")
+        return False
+    except Exception as e:
+        log.error(f"❌ Failed to apply FFmpeg watermark: {e}")
+        import traceback
+        log.error(f"❌ FFmpeg watermark traceback: {traceback.format_exc()}")
+        return False
+
+
+def apply_watermark_to_image(input_path: str, output_path: str, watermark_config: dict) -> bool:
+    """
+    Apply watermark to an image using Pillow (PIL).
+
+    Args:
+        input_path: Path to input image
+        output_path: Path to save watermarked image
+        watermark_config: Dictionary with watermark settings
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import os
+
+        log.info(f"📸 Watermark: Loading image from {input_path}")
+
+        # Load the main image
+        img = Image.open(input_path).convert('RGBA')
+        width, height = img.size
+        log.info(f"📸 Watermark: Image size {width}x{height}")
+
+        # Create watermark layer
+        watermark_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(watermark_layer)
+
+        watermark_type = watermark_config.get('watermark_type', 'text')
+        position = watermark_config.get('watermark_position', 'bottom-right')
+        opacity = int(watermark_config.get('watermark_opacity', 50) * 2.55)  # Convert 0-100 to 0-255
+        rotation = watermark_config.get('watermark_rotation', 0)
+        size_percent = watermark_config.get('watermark_size', 10)
+
+        log.info(f"📸 Watermark: type={watermark_type}, position={position}, opacity={opacity}/255, rotation={rotation}°, size={size_percent}%")
+
+        if watermark_type == 'text':
+            # Text watermark
+            text = watermark_config.get('watermark_text', '')
+            if not text:
+                log.error("📸 Watermark FAILED: No watermark text provided")
+                return False
+
+            log.info(f"📸 Watermark: Adding text '{text[:30]}...'")
+
+
+            color_name = watermark_config.get('watermark_text_color', 'white')
+            color_map = {
+                'white': (255, 255, 255, opacity),
+                'black': (0, 0, 0, opacity),
+                'blue': (0, 0, 255, opacity),
+                'red': (255, 0, 0, opacity)
+            }
+            color = color_map.get(color_name, (255, 255, 255, opacity))
+
+            # Calculate font size based on image size and size_percent
+            font_size = int(min(width, height) * size_percent / 100)
+            if font_size < 10:  # Minimum font size
+                font_size = 10
+
+            try:
+                # Try common font paths
+                font = None
+                font_paths = [
+                    "arial.ttf",
+                    "C:\\Windows\\Fonts\\arial.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/System/Library/Fonts/Helvetica.ttc",  # macOS
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+                ]
+
+                for font_path in font_paths:
+                    try:
+                        font = ImageFont.truetype(font_path, font_size)
+                        break
+                    except (OSError, IOError) as e:
+                        # Font file not found or cannot be read
+                        continue
+
+                # If no TrueType font found, use default (but it won't resize well)
+                if font is None:
+                    log.warning("No TrueType font found, using default font (watermark may be small)")
+                    font = ImageFont.load_default()
+            except Exception as e:
+                log.error(f"Font loading error: {e}")
+                font = ImageFont.load_default()
+
+            # Get text bounding box
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+
+            # Calculate position
+            if position == 'top-left':
+                x, y = 10, 10
+            elif position == 'top':
+                x, y = (width - text_width) // 2, 10
+            elif position == 'top-right':
+                x, y = width - text_width - 10, 10
+            elif position == 'left':
+                x, y = 10, (height - text_height) // 2
+            elif position == 'center':
+                x, y = (width - text_width) // 2, (height - text_height) // 2
+            elif position == 'right':
+                x, y = width - text_width - 10, (height - text_height) // 2
+            elif position == 'bottom-left':
+                x, y = 10, height - text_height - 10
+            elif position == 'bottom':
+                x, y = (width - text_width) // 2, height - text_height - 10
+            else:  # bottom-right
+                x, y = width - text_width - 10, height - text_height - 10
+
+            # Draw text
+            draw.text((x, y), text, font=font, fill=color)
+
+        else:  # logo watermark
+            logo_path = watermark_config.get('watermark_logo_path')
+            if not logo_path:
+                log.error("📸 Watermark FAILED: No logo path provided")
+                return False
+            if not os.path.exists(logo_path):
+                log.error(f"📸 Watermark FAILED: Logo file not found at {logo_path}")
+                return False
+
+            log.info(f"📸 Watermark: Adding logo from {logo_path}")
+
+            # Load logo
+            logo = Image.open(logo_path).convert('RGBA')
+            log.info(f"📸 Watermark: Logo loaded, size: {logo.size[0]}x{logo.size[1]}")
+
+            # Resize logo based on size_percent
+            logo_width = int(width * size_percent / 100)
+            logo_height = int(logo.size[1] * logo_width / logo.size[0])
+            logo = logo.resize((logo_width, logo_height), Image.Resampling.LANCZOS)
+
+            # Apply opacity
+            if opacity < 255:
+                alpha = logo.split()[3]
+                alpha = alpha.point(lambda p: int(p * opacity / 255))
+                logo.putalpha(alpha)
+
+            # Calculate position
+            if position == 'top-left':
+                x, y = 10, 10
+            elif position == 'top':
+                x, y = (width - logo_width) // 2, 10
+            elif position == 'top-right':
+                x, y = width - logo_width - 10, 10
+            elif position == 'left':
+                x, y = 10, (height - logo_height) // 2
+            elif position == 'center':
+                x, y = (width - logo_width) // 2, (height - logo_height) // 2
+            elif position == 'right':
+                x, y = width - logo_width - 10, (height - logo_height) // 2
+            elif position == 'bottom-left':
+                x, y = 10, height - logo_height - 10
+            elif position == 'bottom':
+                x, y = (width - logo_width) // 2, height - logo_height - 10
+            else:  # bottom-right
+                x, y = width - logo_width - 10, height - logo_height - 10
+
+            # Paste logo onto watermark layer
+            watermark_layer.paste(logo, (x, y), logo)
+
+        # Rotate if needed (note: rotation is applied to the entire watermark layer)
+        # Since we need same size for alpha_composite, we don't use expand=True
+        if rotation != 0:
+            watermark_layer = watermark_layer.rotate(-rotation, fillcolor=(0, 0, 0, 0))
+
+        # Composite the watermark onto the original image
+        log.info(f"📸 Watermark: Compositing watermark onto image")
+        img = Image.alpha_composite(img, watermark_layer)
+
+        # Convert back to RGB if saving as JPEG
+        if output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg'):
+            log.info(f"📸 Watermark: Converting to RGB for JPEG")
+            img = img.convert('RGB')
+
+        # Save the result
+        log.info(f"📸 Watermark: Saving watermarked image to {output_path}")
+        img.save(output_path, quality=95)
+        log.info(f"📸 Watermark: ✅ Image watermark completed successfully")
+        return True
+
+    except ImportError as e:
+        log.error(f"❌ Pillow (PIL) not installed. Install with: pip install Pillow")
+        log.error(f"❌ Import error details: {e}")
+        return False
+    except Exception as e:
+        log.error(f"❌ Failed to apply image watermark: {e}")
+        import traceback
+        log.error(f"❌ Watermark traceback: {traceback.format_exc()}")
+        return False
+
+
 # ==================== DATABASE MANAGER ====================
 class DatabaseManager:
     def __init__(self, db_path: str):
@@ -312,14 +675,42 @@ class DatabaseManager:
                 )
             ''')
             
-            # Migration columns
-            for col in ['source_id', 'dest_id', 'sources', 'destinations', 'forward_mode', 'filters', 'modify']:
+            # Migration columns - Whitelist validation for security
+            allowed_columns = ['source_id', 'dest_id', 'sources', 'destinations', 'forward_mode', 'filters', 'modify']
+            for col in allowed_columns:
+                # Validate column name to prevent SQL injection (even though source is trusted)
+                if not col.replace('_', '').isalnum():
+                    log.error(f"Invalid column name: {col}")
+                    continue
                 try:
                     cursor.execute(f'ALTER TABLE forward_rules ADD COLUMN {col} TEXT')
                     log.info(f"Added {col} column")
                 except sqlite3.OperationalError:
-                    pass
-            
+                    pass  # Column already exists
+
+            # File deduplication tracking table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS file_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT,
+                    rule_id INTEGER NOT NULL,
+                    source_chat_id INTEGER NOT NULL,
+                    dest_chat_id INTEGER NOT NULL,
+                    file_size INTEGER,
+                    file_name TEXT,
+                    file_hash TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(file_unique_id, rule_id, dest_chat_id)
+                )
+            ''')
+
+            # Create index for faster lookups
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_file_cache_lookup
+                ON file_cache(file_unique_id, rule_id, dest_chat_id)
+            ''')
+
             conn.commit()
     
     @contextmanager
@@ -399,7 +790,7 @@ class DatabaseManager:
                     if filters_str:
                         try:
                             d['filters'] = json.loads(filters_str)
-                        except:
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             d['filters'] = DEFAULT_FILTERS.copy()
                     else:
                         d['filters'] = DEFAULT_FILTERS.copy()
@@ -408,7 +799,7 @@ class DatabaseManager:
                     if modify_str:
                         try:
                             d['modify'] = json.loads(modify_str)
-                        except:
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             d['modify'] = DEFAULT_MODIFY.copy()
                     else:
                         d['modify'] = DEFAULT_MODIFY.copy()
@@ -434,7 +825,7 @@ class DatabaseManager:
                     if filters_str:
                         try:
                             d['filters'] = json.loads(filters_str)
-                        except:
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             d['filters'] = DEFAULT_FILTERS.copy()
                     else:
                         d['filters'] = DEFAULT_FILTERS.copy()
@@ -443,7 +834,7 @@ class DatabaseManager:
                     if modify_str:
                         try:
                             d['modify'] = json.loads(modify_str)
-                        except:
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             d['modify'] = DEFAULT_MODIFY.copy()
                     else:
                         d['modify'] = DEFAULT_MODIFY.copy()
@@ -545,6 +936,49 @@ class DatabaseManager:
                 cursor.execute('SELECT user_id FROM connected_accounts WHERE phone = ? AND is_active = 1', (phone,))
                 row = cursor.fetchone()
                 return row['user_id'] if row else None
+
+    async def is_file_processed(self, file_unique_id: str, rule_id: int, dest_chat_id: int) -> bool:
+        """Check if file was already processed for this rule and destination."""
+        async with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id FROM file_cache
+                    WHERE file_unique_id = ? AND rule_id = ? AND dest_chat_id = ?
+                ''', (file_unique_id, rule_id, dest_chat_id))
+                return cursor.fetchone() is not None
+
+    async def mark_file_processed(self, file_id: str, file_unique_id: str, rule_id: int,
+                                  source_chat_id: int, dest_chat_id: int,
+                                  file_size: int = 0, file_name: str = None):
+        """Mark file as processed to prevent duplicate forwarding."""
+        async with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO file_cache
+                        (file_id, file_unique_id, rule_id, source_chat_id, dest_chat_id, file_size, file_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (file_id, file_unique_id, rule_id, source_chat_id, dest_chat_id, file_size, file_name))
+                    conn.commit()
+                except Exception as e:
+                    log.error(f"Failed to mark file as processed: {e}")
+
+    async def clear_old_file_cache(self, days: int = 30):
+        """Clear file cache older than specified days."""
+        async with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    DELETE FROM file_cache
+                    WHERE processed_at < datetime('now', '-' || ? || ' days')
+                ''', (days,))
+                deleted = cursor.rowcount
+                conn.commit()
+                if deleted > 0:
+                    log.info(f"🧹 Cleared {deleted} old file cache entries")
+                return deleted
 
 # ==================== SESSION MANAGER ====================
 class UserSessionManager:
@@ -675,7 +1109,36 @@ class UserSessionManager:
         db_ref = self.db
         phone_ref = phone
         entity_cache = {}
-        
+
+        async def retry_on_timeout(func, *args, max_retries=3, **kwargs):
+            """Retry function on timeout/connection errors."""
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except (OSError, TimeoutError, ConnectionError) as e:
+                    error_msg = str(e)
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        log.warning(f"⚠️ [{phone_ref}] Timeout/connection error (attempt {attempt + 1}/{max_retries}): {error_msg}. Retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        # Reconnect client if needed
+                        if not client.is_connected():
+                            log.info(f"🔄 [{phone_ref}] Reconnecting client...")
+                            await client.connect()
+                    else:
+                        log.error(f"❌ [{phone_ref}] Failed after {max_retries} attempts: {error_msg}")
+                        raise
+                except errors.FloodWaitError as e:
+                    if attempt < max_retries - 1:
+                        wait_time = e.seconds
+                        log.warning(f"⚠️ [{phone_ref}] FloodWait: sleeping {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise
+                except Exception as e:
+                    # Don't retry on other errors
+                    raise
+
         async def resolve_dest(dest_str: str):
             """Resolve destination with caching."""
             if dest_str in entity_cache:
@@ -760,27 +1223,88 @@ class UserSessionManager:
             async with album_lock:
                 if grouped_id not in album_cache:
                     return
-                
+
                 album_data = album_cache.pop(grouped_id)
                 messages = album_data['messages']
                 dest_list = album_data['dest_list']
                 rule = album_data['rule']
-                caption_text = album_data.get('caption_text', '')
+                original_caption = album_data.get('caption_text', '')
+                filters = album_data.get('filters', {})
+                modify = album_data.get('modify', {})
                 forward_mode = rule.get('forward_mode', 'forward')
-                
+
                 if not messages:
                     return
-                
+
                 log.info(f"📚 [{phone_ref}] Sending album with {len(messages)} items")
-                
+
+                # Apply caption cleaning to album caption
+                caption_text = original_caption
+
+                # Apply caption cleaning filters
+                if filters.get('clean_caption', False):
+                    caption_text = ""
+                elif caption_text:
+                    # Apply specific cleaners
+                    if filters.get('clean_hashtag', False):
+                        caption_text = re.sub(r'#\w+', '', caption_text)
+                    if filters.get('clean_mention', False):
+                        caption_text = re.sub(r'@\w+', '', caption_text)
+                    if filters.get('clean_link', False):
+                        caption_text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', caption_text)
+                    if filters.get('clean_emoji', False):
+                        import emoji
+                        caption_text = emoji.replace_emoji(caption_text, '')
+                    if filters.get('clean_phone', False):
+                        caption_text = re.sub(r'\+?\d[\d\s\-\(\)]{7,}\d', '', caption_text)
+                    if filters.get('clean_email', False):
+                        caption_text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '', caption_text)
+
+                    # Clean up whitespace
+                    caption_text = re.sub(r'[ \t]+', ' ', caption_text)
+                    caption_text = re.sub(r'^ +| +$', '', caption_text, flags=re.MULTILINE)
+                    caption_text = re.sub(r'\n{3,}', '\n\n', caption_text)
+                    caption_text = caption_text.strip()
+
+                # Apply modify features
+                if modify.get('header_enabled', False):
+                    header = modify.get('header_text', '')
+                    if header:
+                        caption_text = f"{header}\n{caption_text}" if caption_text else header
+
+                if modify.get('footer_enabled', False):
+                    footer = modify.get('footer_text', '')
+                    if footer:
+                        caption_text = f"{caption_text}\n{footer}" if caption_text else footer
+
+                # Check if caption cleaning or modification is active
+                caption_cleaning_active = any([
+                    filters.get('clean_caption', False),
+                    filters.get('clean_hashtag', False),
+                    filters.get('clean_mention', False),
+                    filters.get('clean_link', False),
+                    filters.get('clean_emoji', False),
+                    filters.get('clean_phone', False),
+                    filters.get('clean_email', False)
+                ])
+                modify_caption_active = any([
+                    modify.get('header_enabled', False),
+                    modify.get('footer_enabled', False),
+                    modify.get('replace_enabled', False),
+                    modify.get('watermark_enabled', False)  # Watermark requires copy mode
+                ])
+
+                # Use copy mode if explicitly selected OR if caption/content modification is needed
+                use_copy_mode = (forward_mode == "copy") or caption_cleaning_active or modify_caption_active
+
                 for dest in dest_list:
                     try:
                         dest_entity = await resolve_dest(dest)
                         if dest_entity is None:
                             log.error(f"❌ [{phone_ref}] Could not resolve: {dest}")
                             continue
-                        
-                        if forward_mode == "copy":
+
+                        if use_copy_mode:
                             # COPY MODE: Download and re-upload as album
                             import tempfile
                             import os as temp_os
@@ -788,14 +1312,50 @@ class UserSessionManager:
                             # Download all media files
                             files = []
                             for msg in messages:
-                                temp_file = await client.download_media(msg, file=tempfile.gettempdir())
+                                temp_file = await retry_on_timeout(
+                                    client.download_media,
+                                    msg,
+                                    file=tempfile.gettempdir()
+                                )
                                 if temp_file:
+                                    # Apply watermark if enabled
+                                    if modify.get('watermark_enabled', False):
+                                        try:
+                                            is_image = msg.photo or (hasattr(msg, 'document') and msg.document and hasattr(msg.document, 'mime_type') and msg.document.mime_type and msg.document.mime_type.startswith('image/'))
+                                            is_video = msg.video or (hasattr(msg, 'document') and msg.document and hasattr(msg.document, 'mime_type') and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+
+                                            if is_image or is_video:
+                                                original_file = temp_file
+                                                # Sanitize basename to prevent path traversal
+                                                safe_basename = temp_os.path.basename(temp_file).replace('..', '')
+                                                watermarked_file = temp_os.path.join(
+                                                    temp_os.path.dirname(temp_file),
+                                                    'watermarked_' + safe_basename
+                                                )
+
+                                                success = False
+                                                media_type = "video" if is_video else "image"
+                                                log.info(f"🎨 [{phone_ref}] Album: Applying {media_type} watermark...")
+
+                                                # Use FFmpeg for watermarking (works for both images and videos)
+                                                success = apply_watermark_with_ffmpeg(temp_file, watermarked_file, modify, is_video=is_video)
+
+                                                if success and temp_os.path.exists(watermarked_file):
+                                                    try:
+                                                        temp_os.remove(original_file)
+                                                    except (OSError, IOError) as e:
+                                                        log.warning(f"Failed to cleanup original file {original_file}: {e}")
+                                                    temp_file = watermarked_file
+                                        except Exception as e:
+                                            log.error(f"[{phone_ref}] Album watermark error: {e}")
+
                                     files.append(temp_file)
-                            
+
                             if files:
                                 try:
                                     # Send as album (first file gets caption)
-                                    await client.send_file(
+                                    await retry_on_timeout(
+                                        client.send_file,
                                         dest_entity,
                                         files,
                                         caption=caption_text if caption_text else None
@@ -834,7 +1394,8 @@ class UserSessionManager:
                     rule_id = rule['id']
                     forward_mode = rule.get('forward_mode', 'forward')
                     filters = rule.get('filters', {})
-                    
+                    modify = rule.get('modify', {})
+
                     # Check if message matches ANY source
                     is_match = False
                     matched_source = None
@@ -906,11 +1467,12 @@ class UserSessionManager:
                                     'dest_list': dest_list,
                                     'rule': rule,
                                     'caption_text': msg.message or msg.text or "",
+                                    'filters': filters,  # Store filters for caption cleaning
+                                    'modify': modify,    # Store modify settings
                                 }
-                                # Schedule sending after 1 second (to collect all album items)
-                                asyncio.create_task(asyncio.sleep(1.5))
+                                # Schedule sending after 1.5 seconds (to collect all album items)
                                 asyncio.get_event_loop().call_later(
-                                    1.5, 
+                                    1.5,
                                     lambda gid=grouped_id: asyncio.create_task(send_album_group(gid))
                                 )
                                 log.info(f"📚 [{phone_ref}] Album started: {grouped_id}")
@@ -934,21 +1496,7 @@ class UserSessionManager:
                     if msg.reply_to and filters.get('reply', False):
                         log.info(f"[{phone_ref}] SKIPPED: reply message")
                         continue
-                    
-                    # Check LINK filter (messages containing links)
-                    if filters.get('link', False):
-                        text_to_check = msg.message or msg.text or ""
-                        has_links = bool(re.search(r'https?://|www\.|t\.me/|tg://', text_to_check))
-                        # Also check for MessageEntityUrl or TextUrl in entities
-                        if msg.entities:
-                            for ent in msg.entities:
-                                if hasattr(ent, '__class__') and ent.__class__.__name__ in ['MessageEntityUrl', 'MessageEntityTextUrl']:
-                                    has_links = True
-                                    break
-                        if has_links:
-                            log.info(f"[{phone_ref}] SKIPPED: contains links")
-                            continue
-                    
+
                     # Check BUTTON filter (inline keyboards)
                     if msg.reply_markup and filters.get('button', False):
                         log.info(f"[{phone_ref}] SKIPPED: has buttons")
@@ -978,6 +1526,7 @@ class UserSessionManager:
                     # ========== CAPTION CONTENT CLEANING ==========
                     # Get original text/caption
                     original_text = msg.message or msg.text or ""
+                    original_entities = msg.entities  # Capture original formatting entities
                     filtered_text = original_text
                     removed_items = []
                     
@@ -1112,7 +1661,92 @@ class UserSessionManager:
                         log.info(f"[{phone_ref}] Cleaned: {', '.join(removed_items)}")
                         log.info(f"[{phone_ref}] Before: {original_text[:100]}")
                         log.info(f"[{phone_ref}] After: {filtered_text[:100]}")
-                    
+
+                    # ========== MODIFY CONTENT FEATURES ==========
+
+                    # 1. BLOCK WORDS - Skip message if contains blocked words
+                    if modify.get('block_words_enabled', False):
+                        block_words = modify.get('block_words', [])
+                        if block_words and caption_text:
+                            text_lower = caption_text.lower()
+                            should_skip = False
+                            for word in block_words:
+                                if word.lower() in text_lower:
+                                    log.info(f"[{phone_ref}] SKIPPED: Contains blocked word '{word}'")
+                                    should_skip = True
+                                    break  # Stop checking more words
+                            if should_skip:
+                                continue  # Skip to next rule
+
+                    # 2. WHITELIST WORDS - Skip message if NOT contains whitelist words
+                    if modify.get('whitelist_enabled', False):
+                        whitelist_words = modify.get('whitelist_words', [])
+                        if whitelist_words and caption_text:
+                            text_lower = caption_text.lower()
+                            has_whitelist = any(word.lower() in text_lower for word in whitelist_words)
+                            if not has_whitelist:
+                                log.info(f"[{phone_ref}] SKIPPED: Does not contain any whitelist word")
+                                continue  # Skip to next rule
+
+                    # 3. WORD REPLACEMENT - Replace words/phrases in text
+                    if modify.get('replace_enabled', False):
+                        replace_pairs = modify.get('replace_pairs', [])
+                        if replace_pairs and caption_text:
+                            for pair in replace_pairs:
+                                old = pair.get('from', '')
+                                new = pair.get('to', '')
+                                use_regex = pair.get('regex', False)
+                                if old:
+                                    if use_regex:
+                                        try:
+                                            caption_text = re.sub(old, new, caption_text)
+                                        except Exception as e:
+                                            log.error(f"[{phone_ref}] Regex replace error: {e}")
+                                    else:
+                                        caption_text = caption_text.replace(old, new)
+
+                    # 4. HEADER TEXT - Add text to beginning
+                    if modify.get('header_enabled', False):
+                        header = modify.get('header_text', '')
+                        if header:
+                            caption_text = f"{header}\n{caption_text}" if caption_text else header
+
+                    # 5. FOOTER TEXT - Add text to end
+                    if modify.get('footer_enabled', False):
+                        footer = modify.get('footer_text', '')
+                        if footer:
+                            caption_text = f"{caption_text}\n{footer}" if caption_text else footer
+
+                    # 6. DELAY - Wait before forwarding
+                    if modify.get('delay_enabled', False):
+                        delay_seconds = modify.get('delay_seconds', 0)
+                        if delay_seconds > 0:
+                            log.info(f"[{phone_ref}] Delaying {delay_seconds}s before forwarding...")
+                            await asyncio.sleep(delay_seconds)
+
+                    # 7. LINK BUTTONS - Prepare custom button markup
+                    button_markup = None
+                    if modify.get('buttons_enabled', False) and types:
+                        buttons_data = modify.get('buttons', [])
+                        if buttons_data:
+                            try:
+                                # Build button rows (Telethon requires KeyboardButtonRow objects)
+                                button_rows = []
+                                for row in buttons_data:
+                                    if isinstance(row, list):
+                                        btn_row = []
+                                        for btn in row:
+                                            if isinstance(btn, dict) and 'text' in btn and 'url' in btn:
+                                                btn_row.append(types.KeyboardButtonUrl(btn['text'], btn['url']))
+                                        if btn_row:
+                                            # Wrap each row in KeyboardButtonRow
+                                            button_rows.append(types.KeyboardButtonRow(btn_row))
+                                if button_rows:
+                                    button_markup = types.ReplyInlineMarkup(button_rows)
+                                    log.info(f"[{phone_ref}] Added {len(button_rows)} button row(s)")
+                            except Exception as e:
+                                log.error(f"[{phone_ref}] Button creation error: {e}")
+
                     # Forward/Copy to ALL destinations
                     success_count = 0
                     for dest in dest_list:
@@ -1121,9 +1755,69 @@ class UserSessionManager:
                             if dest_entity is None:
                                 log.error(f"❌ [{phone_ref}] Could not resolve: {dest}")
                                 continue
-                            
-                            if forward_mode == "copy":
+
+                            # Get destination chat ID for deduplication
+                            dest_chat_id = dest_entity.id if hasattr(dest_entity, 'id') else 0
+
+                            # === DEDUPLICATION CHECK ===
+                            # Get file unique ID for duplicate detection
+                            file_unique_id = None
+                            file_id_for_cache = None
+                            file_name_for_cache = None
+
+                            if msg.media:
+                                # Extract file unique ID from media
+                                if hasattr(msg, 'document') and msg.document:
+                                    file_unique_id = getattr(msg.document, 'id', None)
+                                    file_id_for_cache = str(file_unique_id) if file_unique_id else None
+                                    # Get filename from attributes
+                                    for attr in getattr(msg.document, 'attributes', []):
+                                        if hasattr(attr, 'file_name'):
+                                            file_name_for_cache = attr.file_name
+                                            break
+                                elif hasattr(msg, 'photo') and msg.photo:
+                                    # For photos, use the largest size ID
+                                    if hasattr(msg.photo, 'id'):
+                                        file_unique_id = msg.photo.id
+                                        file_id_for_cache = str(file_unique_id)
+
+                            # Check if file was already processed for this rule and destination
+                            if file_unique_id:
+                                is_duplicate = await db_ref.is_file_processed(
+                                    str(file_unique_id),
+                                    rule_id,
+                                    dest_chat_id
+                                )
+                                if is_duplicate:
+                                    log.info(f"⏭️ [{phone_ref}] SKIPPED DUPLICATE: {file_name_for_cache or 'file'} already sent to {dest}")
+                                    continue  # Skip this destination
+
+                            # Check if any caption cleaning is enabled
+                            # If caption cleaning is active, force copy mode to apply the changes
+                            caption_cleaning_active = any([
+                                filters.get('clean_caption', False),
+                                filters.get('clean_hashtag', False),
+                                filters.get('clean_mention', False),
+                                filters.get('clean_link', False),
+                                filters.get('clean_emoji', False),
+                                filters.get('clean_phone', False),
+                                filters.get('clean_email', False)
+                            ])
+
+                            # Also check if modify features that affect caption or media are enabled
+                            modify_caption_active = any([
+                                modify.get('header_enabled', False),
+                                modify.get('footer_enabled', False),
+                                modify.get('replace_enabled', False),
+                                modify.get('watermark_enabled', False)  # Watermark requires copy mode
+                            ])
+
+                            # Use copy mode if explicitly selected OR if caption/content modification is needed
+                            use_copy_mode = (forward_mode == "copy") or caption_cleaning_active or modify_caption_active
+
+                            if use_copy_mode:
                                 # COPY MODE: Download & re-upload with filtered caption
+                                # (Auto-enabled when caption cleaning or modification is active)
                                 
                                 try:
                                     # Use filtered text (hashtags, mentions, links, emojis removed if filter ON)
@@ -1152,7 +1846,8 @@ class UserSessionManager:
                                                 dest_entity,
                                                 caption_text,
                                                 formatting_entities=caption_entities if caption_entities else None,
-                                                link_preview=not remove_link_preview  # Remove preview if link filter ON
+                                                link_preview=not remove_link_preview,  # Remove preview if link filter ON
+                                                buttons=button_markup
                                             )
                                             success_count += 1
                                             log.info(f"🔗 [{phone_ref}] TEXT+PREVIEW -> {dest}")
@@ -1160,32 +1855,200 @@ class UserSessionManager:
                                             # HAS REAL MEDIA - Download and re-send with filtered caption
                                             import tempfile
                                             import os as temp_os
-                                            
-                                            # Download to temp file
-                                            temp_file = await client.download_media(msg, file=tempfile.gettempdir())
-                                            
+
+                                            # Get file size for progress tracking
+                                            file_size = 0
+                                            if hasattr(msg, 'document') and msg.document:
+                                                file_size = msg.document.size
+                                            elif hasattr(msg, 'photo') and msg.photo:
+                                                file_size = max([size.size for size in msg.photo.sizes if hasattr(size, 'size')], default=0)
+                                            elif hasattr(msg, 'video') and msg.video:
+                                                file_size = msg.video.size if hasattr(msg.video, 'size') else 0
+
+                                            # Format file size for logging
+                                            def format_bytes(bytes_num):
+                                                for unit in ['B', 'KB', 'MB', 'GB']:
+                                                    if bytes_num < 1024.0:
+                                                        return f"{bytes_num:.2f} {unit}"
+                                                    bytes_num /= 1024.0
+                                                return f"{bytes_num:.2f} TB"
+
+                                            # Check file size limits (Telegram limits: 2GB for bots, 4GB for premium)
+                                            MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit for bots
+                                            if file_size > MAX_FILE_SIZE:
+                                                log.warning(f"⚠️ [{phone_ref}] Large file detected: {format_bytes(file_size)} (may fail for non-premium)")
+                                            elif file_size > 100 * 1024 * 1024:  # 100MB
+                                                log.info(f"📦 [{phone_ref}] Large file: {format_bytes(file_size)} - using optimized MTProto transfer")
+
+                                            # Progress callback for downloads
+                                            last_percentage = [0]  # Use list to allow modification in nested function
+                                            def download_progress(current, total):
+                                                if total > 0:
+                                                    percentage = int((current / total) * 100)
+                                                    # Log every 10% progress for large files (>10MB)
+                                                    if total > 10 * 1024 * 1024 and percentage >= last_percentage[0] + 10:
+                                                        last_percentage[0] = percentage
+                                                        log.info(f"📥 [{phone_ref}] Downloading: {percentage}% ({format_bytes(current)}/{format_bytes(total)})")
+
+                                            # Download to temp file with progress tracking
+                                            if file_size > 10 * 1024 * 1024:  # Log for files > 10MB
+                                                log.info(f"📥 [{phone_ref}] Starting download: {format_bytes(file_size)}")
+
+                                            temp_file = await retry_on_timeout(
+                                                client.download_media,
+                                                msg,
+                                                file=tempfile.gettempdir(),
+                                                progress_callback=download_progress if file_size > 10 * 1024 * 1024 else None
+                                            )
+
+                                            # 8. FILENAME RENAME - Rename file if enabled
+                                            if temp_file and modify.get('rename_enabled', False):
+                                                rename_pattern = modify.get('rename_pattern', '{original}')
+                                                if rename_pattern and rename_pattern != '{original}':
+                                                    try:
+                                                        import random
+                                                        from datetime import datetime
+
+                                                        # Get original filename
+                                                        original_name = temp_os.path.basename(temp_file)
+                                                        name_parts = temp_os.path.splitext(original_name)
+                                                        original_base = name_parts[0]
+                                                        extension = name_parts[1]
+
+                                                        # Apply pattern replacements
+                                                        new_name = rename_pattern
+                                                        new_name = new_name.replace('{original}', original_base)
+                                                        new_name = new_name.replace('{date}', datetime.now().strftime('%Y%m%d'))
+                                                        new_name = new_name.replace('{time}', datetime.now().strftime('%H%M%S'))
+                                                        new_name = new_name.replace('{random}', str(random.randint(1000, 9999)))
+                                                        # Note: {counter} would need persistent storage, using random for now
+                                                        new_name = new_name.replace('{counter}', str(random.randint(1, 999)))
+
+                                                        # Add extension
+                                                        new_filename = new_name + extension
+
+                                                        # Sanitize filename - remove invalid characters for Windows/Unix
+                                                        invalid_chars = '<>:"/\\|?*\n\r\t'
+                                                        for char in invalid_chars:
+                                                            new_filename = new_filename.replace(char, '_')
+                                                        # Remove multiple underscores and spaces
+                                                        new_filename = re.sub(r'[_\s]+', '_', new_filename)
+                                                        new_filename = new_filename.strip('_')
+
+                                                        new_path = temp_os.path.join(temp_os.path.dirname(temp_file), new_filename)
+
+                                                        # Rename file
+                                                        temp_os.rename(temp_file, new_path)
+                                                        temp_file = new_path
+                                                        log.info(f"[{phone_ref}] Renamed: {original_name} -> {new_filename}")
+                                                    except Exception as e:
+                                                        log.error(f"[{phone_ref}] Rename error: {e}")
+
+                                            # 9. WATERMARK - Apply watermark if enabled
+                                            if temp_file and modify.get('watermark_enabled', False):
+                                                try:
+                                                    # Check if it's an image or video
+                                                    is_image = msg.photo or (hasattr(msg, 'document') and msg.document and hasattr(msg.document, 'mime_type') and msg.document.mime_type and msg.document.mime_type.startswith('image/'))
+                                                    is_video = msg.video or (hasattr(msg, 'document') and msg.document and hasattr(msg.document, 'mime_type') and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+
+                                                    if is_image or is_video:
+                                                        import os as wm_os
+                                                        original_file = temp_file
+                                                        # Sanitize basename to prevent path traversal
+                                                        safe_basename = temp_os.path.basename(temp_file).replace('..', '')
+                                                        watermarked_file = temp_os.path.join(
+                                                            temp_os.path.dirname(temp_file),
+                                                            'watermarked_' + safe_basename
+                                                        )
+
+                                                        # Apply appropriate watermark
+                                                        success = False
+                                                        media_type = "video" if is_video else "image"
+
+                                                        log.info(f"🎨 [{phone_ref}] Applying {media_type} watermark to: {temp_file}")
+                                                        log.info(f"🎨 [{phone_ref}] Watermark config: type={modify.get('watermark_type')}, text={modify.get('watermark_text')[:20] if modify.get('watermark_text') else 'None'}...")
+
+                                                        # Use FFmpeg for watermarking (works for both images and videos)
+                                                        log.info(f"🎨 [{phone_ref}] Applying FFmpeg watermark...")
+                                                        success = apply_watermark_with_ffmpeg(temp_file, watermarked_file, modify, is_video=is_video)
+
+                                                        log.info(f"🎨 [{phone_ref}] {media_type.capitalize()} watermark result: {'SUCCESS' if success else 'FAILED'}")
+
+                                                        if success and wm_os.path.exists(watermarked_file):
+                                                            # Delete original and use watermarked version
+                                                            try:
+                                                                wm_os.remove(original_file)
+                                                            except (OSError, IOError) as e:
+                                                                log.warning(f"Failed to cleanup original file {original_file}: {e}")
+                                                            temp_file = watermarked_file
+                                                            log.info(f"✅ [{phone_ref}] Watermark applied successfully")
+                                                        else:
+                                                            if not success:
+                                                                log.warning(f"⚠️ [{phone_ref}] Watermark failed: watermark function returned False")
+                                                            elif not wm_os.path.exists(watermarked_file):
+                                                                log.warning(f"⚠️ [{phone_ref}] Watermark failed: output file not created at {watermarked_file}")
+                                                            else:
+                                                                log.warning(f"⚠️ [{phone_ref}] Watermark failed, sending original")
+                                                            # Clean up failed watermarked file if it exists
+                                                            try:
+                                                                if wm_os.path.exists(watermarked_file):
+                                                                    wm_os.remove(watermarked_file)
+                                                            except (OSError, IOError) as e:
+                                                                log.warning(f"Failed to cleanup watermarked file {watermarked_file}: {e}")
+
+                                                except Exception as e:
+                                                    log.error(f"[{phone_ref}] Watermark error: {e}")
+                                                    import traceback
+                                                    log.error(f"[{phone_ref}] Watermark traceback: {traceback.format_exc()}")
+                                                    # Continue with original file if watermark fails
+
                                             if temp_file is None:
                                                 log.error(f"❌ [{phone_ref}] Download failed")
                                                 if caption_text:
                                                     await client.send_message(
-                                                        dest_entity, 
+                                                        dest_entity,
                                                         caption_text,
                                                         formatting_entities=caption_entities if caption_entities else None,
-                                                        link_preview=has_web_preview
+                                                        link_preview=has_web_preview,
+                                                        buttons=button_markup
                                                     )
                                                 continue
                                             
                                             try:
+                                                # Progress callback for uploads
+                                                upload_last_percentage = [0]
+                                                def upload_progress(current, total):
+                                                    if total > 0:
+                                                        percentage = int((current / total) * 100)
+                                                        # Log every 10% progress for large files (>10MB)
+                                                        if total > 10 * 1024 * 1024 and percentage >= upload_last_percentage[0] + 10:
+                                                            upload_last_percentage[0] = percentage
+                                                            log.info(f"📤 [{phone_ref}] Uploading: {percentage}% ({format_bytes(current)}/{format_bytes(total)})")
+
+                                                # Get file size for upload progress
+                                                upload_file_size = 0
+                                                if temp_file and temp_os.path.exists(temp_file):
+                                                    upload_file_size = temp_os.path.getsize(temp_file)
+                                                    if upload_file_size > 10 * 1024 * 1024:  # Log for files > 10MB
+                                                        log.info(f"📤 [{phone_ref}] Starting upload: {format_bytes(upload_file_size)}")
+
                                                 # Common send parameters for filtered caption
                                                 caption_kwargs = {}
                                                 if caption_text:
                                                     caption_kwargs['caption'] = caption_text
                                                     if caption_entities:
                                                         caption_kwargs['formatting_entities'] = caption_entities
-                                                
+                                                # Add buttons if enabled
+                                                if button_markup:
+                                                    caption_kwargs['buttons'] = button_markup
+                                                # Add progress callback for large files
+                                                if upload_file_size > 10 * 1024 * 1024:
+                                                    caption_kwargs['progress_callback'] = upload_progress
+
                                                 # PHOTO with caption
                                                 if msg.photo:
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         force_document=False,
@@ -1195,7 +2058,8 @@ class UserSessionManager:
                                                 
                                                 # VIDEO NOTE (round video - no caption)
                                                 elif msg.video_note:
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         video_note=True
@@ -1215,7 +2079,8 @@ class UserSessionManager:
                                                                 ))
                                                                 break
                                                     
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         voice_note=True,
@@ -1224,10 +2089,11 @@ class UserSessionManager:
                                                     # Voice doesn't support caption, send separately
                                                     if original_text:
                                                         await client.send_message(
-                                                            dest_entity, 
+                                                            dest_entity,
                                                             original_text,
                                                             formatting_entities=original_entities,
-                                                            link_preview=has_web_preview
+                                                            link_preview=has_web_preview,
+                                                            buttons=button_markup
                                                         )
                                                     log.info(f"🎤 [{phone_ref}] VOICE -> {dest}")
                                                 
@@ -1246,7 +2112,8 @@ class UserSessionManager:
                                                                 ))
                                                                 break
                                                     
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         supports_streaming=True,
@@ -1255,20 +2122,22 @@ class UserSessionManager:
                                                         **caption_kwargs
                                                     )
                                                     log.info(f"🎥 [{phone_ref}] VIDEO -> {dest}")
-                                                
+
                                                 # GIF / Animation with caption
                                                 elif msg.gif:
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         force_document=False,
                                                         **caption_kwargs
                                                     )
                                                     log.info(f"🎞️ [{phone_ref}] GIF -> {dest}")
-                                                
+
                                                 # STICKER (no caption)
                                                 elif msg.sticker:
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         force_document=False
@@ -1304,7 +2173,8 @@ class UserSessionManager:
                                                         if filename:
                                                             audio_attrs.append(types.DocumentAttributeFilename(filename))
                                                     
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         force_document=False,
@@ -1312,7 +2182,7 @@ class UserSessionManager:
                                                         **caption_kwargs
                                                     )
                                                     log.info(f"🎵 [{phone_ref}] AUDIO -> {dest}")
-                                                
+
                                                 # DOCUMENT (file) with caption
                                                 elif msg.document:
                                                     # Get original filename
@@ -1322,8 +2192,9 @@ class UserSessionManager:
                                                             if hasattr(attr, 'file_name') and attr.file_name:
                                                                 doc_attrs.append(types.DocumentAttributeFilename(attr.file_name))
                                                                 break
-                                                    
-                                                    await client.send_file(
+
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         force_document=True,
@@ -1331,18 +2202,31 @@ class UserSessionManager:
                                                         **caption_kwargs
                                                     )
                                                     log.info(f"📄 [{phone_ref}] DOCUMENT -> {dest}")
-                                                
+
                                                 # OTHER MEDIA with caption
                                                 else:
-                                                    await client.send_file(
+                                                    await retry_on_timeout(
+                                                        client.send_file,
                                                         dest_entity,
                                                         temp_file,
                                                         **caption_kwargs
                                                     )
                                                     log.info(f"📎 [{phone_ref}] MEDIA -> {dest}")
-                                                
+
                                                 success_count += 1
-                                                
+
+                                                # Mark file as processed to prevent duplicates
+                                                if file_unique_id and file_id_for_cache:
+                                                    await db_ref.mark_file_processed(
+                                                        file_id_for_cache,
+                                                        str(file_unique_id),
+                                                        rule_id,
+                                                        chat_id,
+                                                        dest_chat_id,
+                                                        upload_file_size,
+                                                        file_name_for_cache
+                                                    )
+
                                             finally:
                                                 # Clean up temp file
                                                 try:
@@ -1358,7 +2242,8 @@ class UserSessionManager:
                                                 dest_entity,
                                                 caption_text,
                                                 formatting_entities=caption_entities if caption_entities else None,
-                                                link_preview=not remove_link_preview  # Remove preview if link filter ON
+                                                link_preview=not remove_link_preview,  # Remove preview if link filter ON
+                                                buttons=button_markup
                                             )
                                             success_count += 1
                                             log.info(f"💬 [{phone_ref}] TEXT -> {dest}")
@@ -1373,7 +2258,19 @@ class UserSessionManager:
                                 await client.forward_messages(entity=dest_entity, messages=event.message)
                                 success_count += 1
                                 log.info(f"✅ [{phone_ref}] Forwarded -> {dest}")
-                            
+
+                                # Mark file as processed to prevent duplicates
+                                if file_unique_id and file_id_for_cache:
+                                    await db_ref.mark_file_processed(
+                                        file_id_for_cache,
+                                        str(file_unique_id),
+                                        rule_id,
+                                        chat_id,
+                                        dest_chat_id,
+                                        file_size,
+                                        file_name_for_cache
+                                    )
+
                         except Exception as e:
                             log.error(f"❌ [{phone_ref}] {forward_mode} to {dest} failed: {e}")
                     
@@ -1412,6 +2309,14 @@ class ConnectState:
     MODIFY_BUTTONS = "modify_buttons"
     MODIFY_DELAY = "modify_delay"
     MODIFY_HISTORY = "modify_history"
+    MODIFY_WATERMARK = "modify_watermark"
+    MODIFY_WATERMARK_TEXT = "modify_watermark_text"
+    MODIFY_WATERMARK_LOGO = "modify_watermark_logo"
+    MODIFY_WATERMARK_POSITION = "modify_watermark_position"
+    MODIFY_WATERMARK_COLOR = "modify_watermark_color"
+    MODIFY_WATERMARK_OPACITY = "modify_watermark_opacity"
+    MODIFY_WATERMARK_ROTATION = "modify_watermark_rotation"
+    MODIFY_WATERMARK_SIZE = "modify_watermark_size"
     # Edit rule states
     EDIT_RULE_SOURCE = "edit_rule_source"
     EDIT_RULE_DEST = "edit_rule_dest"
@@ -1627,6 +2532,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_modify_delay(query, user)
         elif data == "modify_history":
             await handle_modify_history(query, user)
+        elif data == "modify_watermark":
+            await handle_modify_watermark(query, user)
+        elif data.startswith("watermark_type_"):
+            await handle_watermark_type(query, user, data)
+        elif data.startswith("watermark_pos_"):
+            await handle_watermark_position(query, user, data)
+        elif data.startswith("watermark_color_"):
+            await handle_watermark_color(query, user, data)
+        elif data.startswith("watermark_opacity_"):
+            await handle_watermark_opacity(query, user, data)
+        elif data.startswith("watermark_rotation_"):
+            await handle_watermark_rotation(query, user, data)
+        elif data.startswith("watermark_size_"):
+            await handle_watermark_size(query, user, data)
+        elif data == "watermark_preview":
+            await handle_watermark_preview(query, user)
+        elif data == "watermark_text_input":
+            await handle_watermark_text_input(query, user)
+        elif data == "watermark_logo_input":
+            await handle_watermark_logo_input(query, user)
         elif data.startswith("toggle_"):
             await handle_modify_toggle(query, user, data)
         elif data.startswith("delay_"):
@@ -1689,7 +2614,6 @@ def build_filters_keyboard(filters: dict) -> InlineKeyboardMarkup:
         ('emoji', '😀', 'Emoji'),
         ('forward', '↩️', 'Forwards'),
         ('reply', '💬', 'Reply'),
-        ('link', '🔗', 'Link'),
         ('button', '🔘', 'Button'),
     ]
     
@@ -1741,10 +2665,14 @@ def build_cleaner_keyboard(filters: dict) -> InlineKeyboardMarkup:
     # Header
     buttons.append([InlineKeyboardButton("━━━ ✂️ CAPTION CLEANER ━━━", callback_data="noop")])
     
-    # Remove entire caption option (prominent at top)
+    # Remove all captions - useful for forwarding competitor content without their branding
     caption_status = "✅" if filters.get('clean_caption', False) else "⬜"
-    buttons.append([InlineKeyboardButton(f"{caption_status} ❌ Remove Entire Caption", callback_data="filter_clean_caption")])
-    
+    buttons.append([InlineKeyboardButton(f"{caption_status} 🚫 Remove All Captions", callback_data="filter_clean_caption")])
+
+    # Explanation of how Remove All Captions works
+    buttons.append([InlineKeyboardButton("💡 Auto uses Copy Mode to remove captions", callback_data="noop")])
+    buttons.append([InlineKeyboardButton("Works for: 📷 Photos 🎥 Videos 📄 Docs", callback_data="noop")])
+
     buttons.append([InlineKeyboardButton("─ Or remove specific items: ─", callback_data="noop")])
     
     cleaner_options = [
@@ -1840,14 +2768,20 @@ def build_modify_keyboard(modify: dict) -> InlineKeyboardMarkup:
     history_status = "✅" if modify.get('history_enabled') else "⬜"
     history_count = modify.get('history_count', 0)
     buttons.append([InlineKeyboardButton(f"{history_status} 📜 History ({history_count} msgs)", callback_data="modify_history")])
-    
+
+    # Watermark
+    watermark_status = "✅" if modify.get('watermark_enabled') else "⬜"
+    watermark_type = modify.get('watermark_type', 'text')
+    watermark_icon = "📝" if watermark_type == 'text' else "🖼"
+    buttons.append([InlineKeyboardButton(f"{watermark_status} {watermark_icon} Watermark", callback_data="modify_watermark")])
+
     # Navigation
     buttons.append([
         InlineKeyboardButton("🔙 Back", callback_data="modify_back"),
         InlineKeyboardButton("✅ Done", callback_data="modify_done")
     ])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-    
+
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1866,6 +2800,7 @@ async def show_modify_keyboard(query, user, state):
         state.modify.get('buttons_enabled', False),
         state.modify.get('delay_enabled', False),
         state.modify.get('history_enabled', False),
+        state.modify.get('watermark_enabled', False),
     ])
     
     text = (
@@ -1890,9 +2825,9 @@ async def show_filters_keyboard(query, user, state):
     mode_text = "📤 Forward" if state.forward_mode == "forward" else "📋 Copy"
     
     # Count active filters
-    ignore_keys = ['document', 'video', 'audio', 'sticker', 'text', 'photo', 
-                   'photo_only', 'photo_with_text', 'album', 'poll', 'voice', 
-                   'video_note', 'gif', 'emoji', 'forward', 'reply', 'link', 'button']
+    ignore_keys = ['document', 'video', 'audio', 'sticker', 'text', 'photo',
+                   'photo_only', 'photo_with_text', 'album', 'poll', 'voice',
+                   'video_note', 'gif', 'emoji', 'forward', 'reply', 'button']
     active_ignores = sum(1 for k in ignore_keys if state.filters.get(k, False))
     
     text = (
@@ -2048,10 +2983,12 @@ async def handle_modify_back(query, user):
                                            ConnectState.MODIFY_BLOCK_WORDS, ConnectState.MODIFY_WHITELIST,
                                            ConnectState.MODIFY_REPLACE, ConnectState.MODIFY_HEADER,
                                            ConnectState.MODIFY_FOOTER, ConnectState.MODIFY_BUTTONS,
-                                           ConnectState.MODIFY_DELAY, ConnectState.MODIFY_HISTORY]:
+                                           ConnectState.MODIFY_DELAY, ConnectState.MODIFY_HISTORY,
+                                           ConnectState.MODIFY_WATERMARK, ConnectState.MODIFY_WATERMARK_TEXT,
+                                           ConnectState.MODIFY_WATERMARK_LOGO]:
             await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
             return
-        
+
         state.step = ConnectState.ADD_RULE_CLEANER
         await show_cleaner_keyboard(query, user, state)
 
@@ -2374,6 +3311,283 @@ async def handle_modify_history(query, user):
             parse_mode='Markdown'
         )
 
+async def handle_modify_watermark(query, user):
+    """Configure watermark settings - main menu."""
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state or state.step not in [ConnectState.ADD_RULE_MODIFY, ConnectState.MODIFY_WATERMARK,
+                                            ConnectState.MODIFY_WATERMARK_TEXT, ConnectState.MODIFY_WATERMARK_LOGO]:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.step = ConnectState.MODIFY_WATERMARK
+        enabled = state.modify.get('watermark_enabled', False)
+        watermark_type = state.modify.get('watermark_type', 'text')
+        watermark_text = state.modify.get('watermark_text', '')
+        position = state.modify.get('watermark_position', 'bottom-right')
+        opacity = state.modify.get('watermark_opacity', 50)
+        rotation = state.modify.get('watermark_rotation', 0)
+        size = state.modify.get('watermark_size', 10)
+
+        # Build status text
+        type_icon = "📝" if watermark_type == 'text' else "🖼"
+        status_lines = [
+            f"*{type_icon} Watermark Configuration*\n",
+            f"Status: {'✅ Enabled' if enabled else '⬜ Disabled'}\n",
+            f"Type: {type_icon} {'Text' if watermark_type == 'text' else 'Logo'}\n",
+        ]
+
+        if watermark_type == 'text' and watermark_text:
+            text_preview = watermark_text[:30] + "..." if len(watermark_text) > 30 else watermark_text
+            color = state.modify.get('watermark_text_color', 'white')
+            status_lines.append(f"Text: `{text_preview}`\n")
+            status_lines.append(f"Color: {color}\n")
+        elif watermark_type == 'logo':
+            has_logo = state.modify.get('watermark_logo_file_id') or state.modify.get('watermark_logo_path')
+            status_lines.append(f"Logo: {'✅ Uploaded' if has_logo else '⬜ Not set'}\n")
+
+        status_lines.extend([
+            f"Position: {position}\n",
+            f"Opacity: {opacity}%\n",
+            f"Rotation: {rotation}°\n",
+            f"Size: {size}%\n",
+        ])
+
+        buttons = []
+
+        # Type selection
+        buttons.append([InlineKeyboardButton("━━━ TYPE ━━━", callback_data="noop")])
+        buttons.append([
+            InlineKeyboardButton(f"{'✅' if watermark_type == 'text' else '⬜'} 📝 Text", callback_data="watermark_type_text"),
+            InlineKeyboardButton(f"{'✅' if watermark_type == 'logo' else '⬜'} 🖼 Logo", callback_data="watermark_type_logo")
+        ])
+
+        # Content configuration
+        if watermark_type == 'text':
+            buttons.append([InlineKeyboardButton(f"📝 Set Text: {watermark_text[:10] if watermark_text else 'None'}...", callback_data="watermark_text_input")])
+            # Color selection
+            color = state.modify.get('watermark_text_color', 'white')
+            buttons.append([InlineKeyboardButton("━━━ COLOR ━━━", callback_data="noop")])
+            buttons.append([
+                InlineKeyboardButton(f"{'✅' if color == 'white' else '⬜'} ⚪", callback_data="watermark_color_white"),
+                InlineKeyboardButton(f"{'✅' if color == 'black' else '⬜'} ⚫", callback_data="watermark_color_black"),
+                InlineKeyboardButton(f"{'✅' if color == 'blue' else '⬜'} 🔵", callback_data="watermark_color_blue"),
+                InlineKeyboardButton(f"{'✅' if color == 'red' else '⬜'} 🔴", callback_data="watermark_color_red")
+            ])
+        else:
+            buttons.append([InlineKeyboardButton("🖼 Upload Logo", callback_data="watermark_logo_input")])
+
+        # Position selection
+        buttons.append([InlineKeyboardButton("━━━ POSITION ━━━", callback_data="noop")])
+        buttons.append([
+            InlineKeyboardButton("↖" if position == "top-left" else "⬜", callback_data="watermark_pos_top-left"),
+            InlineKeyboardButton("⬆" if position == "top" else "⬜", callback_data="watermark_pos_top"),
+            InlineKeyboardButton("↗" if position == "top-right" else "⬜", callback_data="watermark_pos_top-right")
+        ])
+        buttons.append([
+            InlineKeyboardButton("⬅" if position == "left" else "⬜", callback_data="watermark_pos_left"),
+            InlineKeyboardButton("🎯" if position == "center" else "⬜", callback_data="watermark_pos_center"),
+            InlineKeyboardButton("➡" if position == "right" else "⬜", callback_data="watermark_pos_right")
+        ])
+        buttons.append([
+            InlineKeyboardButton("↙" if position == "bottom-left" else "⬜", callback_data="watermark_pos_bottom-left"),
+            InlineKeyboardButton("⬇" if position == "bottom" else "⬜", callback_data="watermark_pos_bottom"),
+            InlineKeyboardButton("↘" if position == "bottom-right" else "⬜", callback_data="watermark_pos_bottom-right")
+        ])
+
+        # Opacity selection
+        buttons.append([InlineKeyboardButton(f"━━━ OPACITY: {opacity}% ━━━", callback_data="noop")])
+        buttons.append([
+            InlineKeyboardButton("10%", callback_data="watermark_opacity_10"),
+            InlineKeyboardButton("25%", callback_data="watermark_opacity_25"),
+            InlineKeyboardButton("50%", callback_data="watermark_opacity_50"),
+            InlineKeyboardButton("75%", callback_data="watermark_opacity_75"),
+            InlineKeyboardButton("100%", callback_data="watermark_opacity_100")
+        ])
+
+        # Rotation selection
+        buttons.append([InlineKeyboardButton(f"━━━ ROTATION: {rotation}° ━━━", callback_data="noop")])
+        buttons.append([
+            InlineKeyboardButton("0°", callback_data="watermark_rotation_0"),
+            InlineKeyboardButton("45°", callback_data="watermark_rotation_45"),
+            InlineKeyboardButton("90°", callback_data="watermark_rotation_90"),
+            InlineKeyboardButton("180°", callback_data="watermark_rotation_180")
+        ])
+
+        # Size selection
+        buttons.append([InlineKeyboardButton(f"━━━ SIZE: {size}% ━━━", callback_data="noop")])
+        buttons.append([
+            InlineKeyboardButton("10%", callback_data="watermark_size_10"),
+            InlineKeyboardButton("20%", callback_data="watermark_size_20"),
+            InlineKeyboardButton("30%", callback_data="watermark_size_30"),
+            InlineKeyboardButton("50%", callback_data="watermark_size_50")
+        ])
+
+        # Preview and control buttons
+        buttons.append([InlineKeyboardButton("👁 Preview", callback_data="watermark_preview")])
+        buttons.append([InlineKeyboardButton(f"{'🔴 Disable' if enabled else '🟢 Enable'}", callback_data="toggle_watermark")])
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="modify_back_to_main")])
+
+        await query.edit_message_text(
+            ''.join(status_lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode='Markdown'
+        )
+
+async def handle_watermark_type(query, user, data: str):
+    """Handle watermark type selection."""
+    watermark_type = data.replace("watermark_type_", "")
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_type'] = watermark_type
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_position(query, user, data: str):
+    """Handle watermark position selection."""
+    position = data.replace("watermark_pos_", "")
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_position'] = position
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_color(query, user, data: str):
+    """Handle watermark text color selection."""
+    color = data.replace("watermark_color_", "")
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_text_color'] = color
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_opacity(query, user, data: str):
+    """Handle watermark opacity selection."""
+    opacity = int(data.replace("watermark_opacity_", ""))
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_opacity'] = opacity
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_rotation(query, user, data: str):
+    """Handle watermark rotation selection."""
+    rotation = int(data.replace("watermark_rotation_", ""))
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_rotation'] = rotation
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_size(query, user, data: str):
+    """Handle watermark size selection."""
+    size = int(data.replace("watermark_size_", ""))
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.modify['watermark_size'] = size
+
+    # Call outside lock to avoid double-locking
+    await handle_modify_watermark(query, user)
+
+async def handle_watermark_preview(query, user):
+    """Show watermark preview."""
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        watermark_type = state.modify.get('watermark_type', 'text')
+        if watermark_type == 'text':
+            text = state.modify.get('watermark_text', '')
+            if not text:
+                await query.answer("⚠️ Please set watermark text first!", show_alert=True)
+                return
+        else:
+            has_logo = state.modify.get('watermark_logo_file_id') or state.modify.get('watermark_logo_path')
+            if not has_logo:
+                await query.answer("⚠️ Please upload logo image first!", show_alert=True)
+                return
+
+        await query.answer("👁 Preview will be shown when processing media", show_alert=True)
+
+async def handle_watermark_text_input(query, user):
+    """Prompt user to enter watermark text."""
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.step = ConnectState.MODIFY_WATERMARK_TEXT
+        current_text = state.modify.get('watermark_text', '')
+
+        await query.edit_message_text(
+            f"*📝 Watermark Text*\n\n"
+            f"Current: `{current_text if current_text else 'Not set'}`\n\n"
+            f"Send me the text you want to use as watermark.\n"
+            f"Example: © MyChannel",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="modify_back_to_main")]]),
+            parse_mode='Markdown'
+        )
+
+async def handle_watermark_logo_input(query, user):
+    """Prompt user to upload logo image."""
+    lock = await get_connect_lock(user.id)
+    async with lock:
+        state = connect_states.get(user.id)
+        if not state:
+            await query.edit_message_text("❌ Session expired.", reply_markup=main_menu_kb())
+            return
+
+        state.step = ConnectState.MODIFY_WATERMARK_LOGO
+
+        await query.edit_message_text(
+            "*🖼 Watermark Logo*\n\n"
+            "Send me an image (PNG with transparency recommended) to use as watermark logo.\n\n"
+            "The image will be resized according to your size settings.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="modify_back_to_main")]]),
+            parse_mode='Markdown'
+        )
+
 async def handle_modify_toggle(query, user, data: str):
     """Handle toggle buttons for modify options."""
     toggle_type = data.replace("toggle_", "")
@@ -2396,6 +3610,7 @@ async def handle_modify_toggle(query, user, data: str):
             'buttons': 'buttons_enabled',
             'delay': 'delay_enabled',
             'history': 'history_enabled',
+            'watermark': 'watermark_enabled',
         }
         
         key = toggle_map.get(toggle_type)
@@ -2544,29 +3759,85 @@ async def finalize_rule_creation(query, user):
             # CREATE new rule
             rule_id = await db.add_forward_rule(user.id, phone, sources, destinations, mode, filters_dict, modify_dict)
             action_text = "Created"
-        
+
+            # 9. HISTORY - Forward past messages if enabled
+            if modify_dict.get('history_enabled', False):
+                history_count = modify_dict.get('history_count', 0)
+                if history_count > 0:
+                    try:
+                        client = session_manager.clients.get(phone)
+                        if client and client.is_connected():
+                            log.info(f"[{phone}] Forwarding {history_count} past messages from history...")
+                            for source in sources:
+                                try:
+                                    # Resolve source entity
+                                    if source.startswith('@'):
+                                        source_entity = await client.get_entity(source)
+                                    else:
+                                        source_id = int(source)
+                                        source_entity = await client.get_entity(source_id)
+
+                                    # Get past messages
+                                    messages = await client.get_messages(source_entity, limit=history_count)
+                                    log.info(f"[{phone}] Found {len(messages)} messages in {source}")
+
+                                    # Forward to all destinations
+                                    for dest in destinations:
+                                        try:
+                                            if dest.startswith('@'):
+                                                dest_entity = await client.get_entity(dest)
+                                            else:
+                                                dest_id = int(dest)
+                                                dest_entity = await client.get_entity(dest_id)
+
+                                            # Forward messages (reversed to maintain chronological order)
+                                            if messages:
+                                                await client.forward_messages(dest_entity, messages[::-1])
+                                                log.info(f"✅ [{phone}] Forwarded {len(messages)} history messages: {source} -> {dest}")
+                                        except Exception as e:
+                                            log.error(f"❌ [{phone}] History forward failed to {dest}: {e}")
+                                except Exception as e:
+                                    log.error(f"❌ [{phone}] History fetch failed from {source}: {e}")
+                    except Exception as e:
+                        log.error(f"❌ [{phone}] History feature error: {e}")
+
         # Ensure handler is attached/refreshed
         await session_manager.attach_forward_handler(phone)
         
         connect_states.pop(user.id, None)
-        
-        mode_text = "📤 Forward" if mode == "forward" else "📋 Copy"
-        
+
         # Count enabled ignore filters
-        ignore_keys = ['document', 'video', 'audio', 'sticker', 'text', 'photo', 
-                       'photo_only', 'photo_with_text', 'album', 'poll', 'voice', 
+        ignore_keys = ['document', 'video', 'audio', 'sticker', 'text', 'photo',
+                       'photo_only', 'photo_with_text', 'album', 'poll', 'voice',
                        'video_note', 'gif', 'emoji', 'forward', 'reply', 'link', 'button']
         active_ignores = sum(1 for k in ignore_keys if filters_dict.get(k, False))
-        
+
         # Count enabled cleaner filters
-        cleaner_keys = ['clean_caption', 'clean_hashtag', 'clean_mention', 'clean_link', 
+        cleaner_keys = ['clean_caption', 'clean_hashtag', 'clean_mention', 'clean_link',
                         'clean_emoji', 'clean_phone', 'clean_email']
         active_cleaners = sum(1 for k in cleaner_keys if filters_dict.get(k, False))
+
+        # Check if caption cleaning or modification forces copy mode
+        caption_cleaning_active = any(filters_dict.get(k, False) for k in cleaner_keys)
+        modify_caption_active = any([
+            modify_dict.get('header_enabled', False),
+            modify_dict.get('footer_enabled', False),
+            modify_dict.get('replace_enabled', False),
+            modify_dict.get('watermark_enabled', False)
+        ])
+
+        # Determine actual mode being used
+        if mode == "forward" and (caption_cleaning_active or modify_caption_active):
+            mode_text = "📤 Forward → 📋 Copy (auto)"
+        elif mode == "forward":
+            mode_text = "📤 Forward"
+        else:
+            mode_text = "📋 Copy"
         
         # Count enabled modify options
         modify_keys = ['rename_enabled', 'block_words_enabled', 'whitelist_enabled',
                        'replace_enabled', 'header_enabled', 'footer_enabled',
-                       'buttons_enabled', 'delay_enabled', 'history_enabled']
+                       'buttons_enabled', 'delay_enabled', 'history_enabled', 'watermark_enabled']
         active_mods = sum(1 for k in modify_keys if modify_dict.get(k, False))
         
         await query.edit_message_text(
@@ -2780,9 +4051,34 @@ async def handle_rule_callback(query, user, data: str):
         source_list = rule.get('source_list', [])
         dest_list = rule.get('dest_list', [])
         forward_mode = rule.get('forward_mode', 'forward')
-        mode_text = "📤 Forward" if forward_mode == "forward" else "📋 Copy"
         filters = rule.get('filters', {})
+        modify = rule.get('modify', {})
         phone = rule['phone']
+
+        # Check if caption cleaning or modification forces copy mode
+        caption_cleaning_active = any([
+            filters.get('clean_caption', False),
+            filters.get('clean_hashtag', False),
+            filters.get('clean_mention', False),
+            filters.get('clean_link', False),
+            filters.get('clean_emoji', False),
+            filters.get('clean_phone', False),
+            filters.get('clean_email', False)
+        ])
+        modify_caption_active = any([
+            modify.get('header_enabled', False),
+            modify.get('footer_enabled', False),
+            modify.get('replace_enabled', False),
+            modify.get('watermark_enabled', False)
+        ])
+
+        # Determine actual mode being used
+        if forward_mode == "forward" and (caption_cleaning_active or modify_caption_active):
+            mode_text = "📤 Forward → 📋 Copy (auto)"
+        elif forward_mode == "forward":
+            mode_text = "📤 Forward"
+        else:
+            mode_text = "📋 Copy"
         
         # Try to get entity names
         async def get_entity_display(identifier: str) -> str:
@@ -2804,9 +4100,9 @@ async def handle_rule_callback(query, user, data: str):
                             # Escape special characters in name
                             safe_name = safe_text(name)
                             return f"{safe_name} ({identifier})"
-                        except:
+                        except Exception:
                             return identifier
-            except:
+            except Exception:
                 pass
             return identifier
         
@@ -2894,13 +4190,45 @@ async def handle_rule_callback(query, user, data: str):
             return
         
         forward_mode = rule.get('forward_mode', 'forward')
-        mode_text = "📤 Forward" if forward_mode == "forward" else "📋 Copy"
+        filters = rule.get('filters', {})
+        modify = rule.get('modify', {})
         source_list = rule.get('source_list', [])
         dest_list = rule.get('dest_list', [])
-        
+
+        # Check if caption cleaning or modification forces copy mode
+        caption_cleaning_active = any([
+            filters.get('clean_caption', False),
+            filters.get('clean_hashtag', False),
+            filters.get('clean_mention', False),
+            filters.get('clean_link', False),
+            filters.get('clean_emoji', False),
+            filters.get('clean_phone', False),
+            filters.get('clean_email', False)
+        ])
+        modify_caption_active = any([
+            modify.get('header_enabled', False),
+            modify.get('footer_enabled', False),
+            modify.get('replace_enabled', False),
+            modify.get('watermark_enabled', False)
+        ])
+
+        # Determine actual mode being used
+        if forward_mode == "forward" and (caption_cleaning_active or modify_caption_active):
+            mode_text = "📤 Forward → 📋 Copy (auto)"
+            auto_copy_hint = "\n💡 Using Copy Mode (caption cleaning/modification enabled)"
+        elif forward_mode == "forward":
+            mode_text = "📤 Forward"
+            auto_copy_hint = ""
+        else:
+            mode_text = "📋 Copy"
+            auto_copy_hint = ""
+
         # Build mode button with current mode marked as 🟢
         if forward_mode == "forward":
-            mode_btn = InlineKeyboardButton("🟢 📤 Forward | 📋 Copy", callback_data=f"rule_chmode_copy_{rule_id}")
+            if caption_cleaning_active or modify_caption_active:
+                mode_btn = InlineKeyboardButton("🟢 📤 Forward → 📋 Copy (auto)", callback_data=f"rule_chmode_copy_{rule_id}")
+            else:
+                mode_btn = InlineKeyboardButton("🟢 📤 Forward | 📋 Copy", callback_data=f"rule_chmode_copy_{rule_id}")
         else:
             mode_btn = InlineKeyboardButton("📤 Forward | 🟢 📋 Copy", callback_data=f"rule_chmode_forward_{rule_id}")
         
@@ -2909,7 +4237,7 @@ async def handle_rule_callback(query, user, data: str):
             f"📱 Phone: {rule['phone']}\n"
             f"📥 Sources: {len(source_list)}\n"
             f"📤 Destinations: {len(dest_list)}\n"
-            f"⚙️ Mode: {mode_text}\n\n"
+            f"⚙️ Mode: {mode_text}{auto_copy_hint}\n\n"
             f"What do you want to change?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📥 Sources", callback_data=f"rule_chsrc_{rule_id}")],
@@ -3126,24 +4454,44 @@ async def start_add_rule_for_phone(query, user, phone: str):
     )
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message:
         return
-    
+
     user = update.effective_user
     if not user:
         return
-    
-    text = update.message.text.strip()
-    
-    if text.startswith('/'):
+
+    # Get text if available (for text-based states)
+    text = update.message.text.strip() if update.message.text else ""
+
+    # Skip commands
+    if text and text.startswith('/'):
         return
-    
+
     lock = await get_connect_lock(user.id)
     async with lock:
         state = connect_states.get(user.id)
         if not state:
             return
-        
+
+        # For watermark logo state, accept media without text
+        if state.step == ConnectState.MODIFY_WATERMARK_LOGO:
+            # Check if media was sent
+            if not (update.message.photo or update.message.sticker or
+                    update.message.animation or update.message.document):
+                # No media sent, ask for it
+                await update.message.reply_text(
+                    "❌ Please send an image, sticker, GIF, or image document for the watermark logo.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+                    ])
+                )
+                return
+        else:
+            # For all other states, we need text
+            if not text:
+                return
+
         try:
             if state.step == ConnectState.WAITING_PHONE:
                 await handle_phone_input(update, user, state, text)
@@ -3170,6 +4518,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await handle_modify_footer_input(update, user, state, text)
             elif state.step == ConnectState.MODIFY_BUTTONS:
                 await handle_modify_buttons_input(update, user, state, text)
+            elif state.step == ConnectState.MODIFY_WATERMARK_TEXT:
+                await handle_watermark_text_message(update, user, state, text)
+            elif state.step == ConnectState.MODIFY_WATERMARK_LOGO:
+                await handle_watermark_logo_message(update, context, user, state)
             # Edit rule handlers
             elif state.step == ConnectState.EDIT_RULE_SOURCE:
                 await handle_edit_source_input(update, user, state, text)
@@ -3571,6 +4923,186 @@ async def handle_modify_buttons_input(update, user, state, text: str):
         ])
     )
 
+async def handle_watermark_text_message(update, user, state, text: str):
+    """Handle watermark text input."""
+    watermark_text = text.strip()
+    state.modify['watermark_text'] = watermark_text
+    state.modify['watermark_enabled'] = True
+    state.step = ConnectState.ADD_RULE_MODIFY
+
+    await update.message.reply_text(
+        f"✅ Watermark text set: `{watermark_text[:50]}`",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+async def handle_watermark_logo_message(update, context, user, state):
+    """Handle watermark logo image/sticker/GIF upload."""
+    import tempfile
+    import os
+    from pathlib import Path
+
+    # Check what type of media was sent
+    file_to_download = None
+    file_id = None
+    media_type = None
+
+    if update.message.photo:
+        # Photo sent
+        photo = update.message.photo[-1]  # Get highest resolution
+        file_id = photo.file_id
+        media_type = "photo"
+        log.info(f"📷 Watermark logo: Photo received (file_id: {file_id})")
+    elif update.message.sticker:
+        # Sticker sent
+        sticker = update.message.sticker
+        file_id = sticker.file_id
+        media_type = "sticker"
+        log.info(f"🎨 Watermark logo: Sticker received (file_id: {file_id})")
+    elif update.message.animation:
+        # GIF/animation sent
+        animation = update.message.animation
+        file_id = animation.file_id
+        media_type = "gif"
+        log.info(f"🎬 Watermark logo: GIF/Animation received (file_id: {file_id})")
+    elif update.message.document:
+        # Document (image file) sent
+        document = update.message.document
+        if document.mime_type and document.mime_type.startswith('image/'):
+            file_id = document.file_id
+            media_type = "document"
+            log.info(f"📄 Watermark logo: Image document received (file_id: {file_id})")
+        else:
+            await update.message.reply_text(
+                "❌ Please send an image, sticker, or GIF.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+                ])
+            )
+            return
+    else:
+        await update.message.reply_text(
+            "❌ Please send an image, sticker, or GIF.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+            ])
+        )
+        return
+
+    # Download and save the logo
+    try:
+        log.info(f"💾 Downloading watermark logo (type: {media_type})...")
+
+        file = await context.bot.get_file(file_id)
+
+        # Create a persistent directory for watermark logos (not temp)
+        # This ensures logos persist across sessions
+        logo_dir = Path.home() / ".telegram_bot" / "watermark_logos"
+        logo_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine file extension based on media type
+        if media_type == "sticker":
+            # Stickers are usually WebP, but we'll convert to PNG
+            ext = ".png"
+        elif media_type == "gif":
+            # For GIFs, we'll save as PNG (first frame) for watermarking
+            ext = ".png"
+        else:
+            # For photos/documents, preserve extension or use PNG
+            ext = ".png"
+
+        logo_path = str(logo_dir / f"watermark_logo_{user.id}{ext}")
+
+        # Download the file to a temporary location first
+        temp_download = str(logo_dir / f"temp_logo_{user.id}")
+        await file.download_to_drive(temp_download)
+
+        log.info(f"✅ Watermark logo downloaded to: {temp_download}")
+
+        # Convert to PNG using FFmpeg (works for all media types)
+        # This ensures animated stickers/GIFs are converted to static PNG
+        try:
+            import subprocess
+
+            log.info(f"🎬 Converting logo to static PNG using FFmpeg...")
+
+            # Use FFmpeg to extract first frame and save as PNG
+            # -frames:v 1 = extract only first frame
+            # -update 1 = allow writing single image
+            # -f image2 = force image output format
+            ffmpeg_cmd = [
+                'ffmpeg', '-i', temp_download,
+                '-frames:v', '1',     # Extract first frame only
+                '-update', '1',       # Allow overwriting single image
+                '-f', 'image2',       # Force image format
+                '-y',                 # Overwrite output
+                logo_path
+            ]
+
+            log.info(f"🎬 FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                log.info(f"✅ Logo converted to PNG successfully")
+                # Remove temp file
+                try:
+                    os.remove(temp_download)
+                except (OSError, IOError) as e:
+                    log.warning(f"Failed to cleanup temp download {temp_download}: {e}")
+            else:
+                # If FFmpeg fails, just rename the temp file
+                log.warning(f"⚠️ FFmpeg conversion failed, using original file")
+                log.warning(f"⚠️ FFmpeg error: {result.stderr}")
+                os.rename(temp_download, logo_path)
+
+        except Exception as conv_error:
+            log.warning(f"⚠️ Could not convert logo with FFmpeg: {conv_error}")
+            # If conversion fails, just use the downloaded file
+            try:
+                os.rename(temp_download, logo_path)
+            except (OSError, IOError) as e:
+                log.error(f"Failed to rename temp file to logo path: {e}")
+
+        # Save to state
+        state.modify['watermark_logo_file_id'] = file_id
+        state.modify['watermark_logo_path'] = logo_path
+        state.modify['watermark_type'] = 'logo'  # Automatically set to logo type
+        state.modify['watermark_enabled'] = True
+        state.step = ConnectState.ADD_RULE_MODIFY
+
+        # Verify file exists
+        if os.path.exists(logo_path):
+            file_size = os.path.getsize(logo_path)
+            log.info(f"✅ Logo file verified: {file_size} bytes")
+
+            await update.message.reply_text(
+                f"✅ Logo uploaded successfully!\n"
+                f"📁 Saved as: {Path(logo_path).name}\n"
+                f"📊 Size: {file_size} bytes\n"
+                f"🎨 Type: {media_type.upper()}\n\n"
+                f"Logo will be applied to both images and videos.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+                ])
+            )
+        else:
+            raise Exception("Logo file not found after download")
+
+    except Exception as e:
+        log.error(f"❌ Failed to download/process logo: {e}")
+        import traceback
+        log.error(f"❌ Logo error traceback: {traceback.format_exc()}")
+
+        await update.message.reply_text(
+            f"❌ Failed to upload logo: {e}\n\n"
+            f"Please try again with a different image.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Watermark", callback_data="modify_watermark")]
+            ])
+        )
+
 # ==================== EDIT RULE INPUT HANDLERS ====================
 
 async def handle_edit_source_input(update, user, state, text: str):
@@ -3737,7 +5269,11 @@ def main():
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # Accept text messages, photos, stickers, animations (GIFs), and documents
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.ANIMATION | filters.Sticker.ALL | filters.Document.ALL) & ~filters.COMMAND,
+        message_handler
+    ))
     
     log.info("=" * 50)
     log.info("🤖 Telegram Auto-Forward Bot")
@@ -3757,6 +5293,10 @@ def main():
 
 if __name__ == '__main__':
     import sys
-    from keep_alive import keep_alive
-    keep_alive()
+    # Optional keep_alive for services like Replit
+    try:
+        from keep_alive import keep_alive
+        keep_alive()
+    except ImportError:
+        pass  # keep_alive module not available, continue without it
     sys.exit(main())
