@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Multi-User Telegram Auto-Forward Bot
-=====================================
-Features:
-- Multiple sources per rule (comma-separated)
-- Multiple destinations per rule (comma-separated)
-- Per-user session management
-- SQLite database storage
-- Large file support (up to 2GB) with MTProto optimization
-- Progress tracking for downloads/uploads (files > 10MB)
-- Automatic chunking and optimized transfer
-"""
 
 import asyncio
 import logging
