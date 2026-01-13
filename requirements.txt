@@ -1,32 +1,5 @@
-# Telegram Bot Framework
-python-telegram-bot==21.3
-
-# Telegram MTProto Client (for user account features)
-telethon==1.36.0
-
-# Async support
-asyncio-throttle==1.0.2
-
-# Cryptography for Telethon
-cryptography>=41.0.0
-pyaes==1.6.1
-
-# Database (SQLite is built-in, but add aiosqlite for async)
-aiosqlite==0.19.0
-
-# Environment variables
+python-telegram-bot==21.6
+telethon==1.35.0
 python-dotenv==1.0.1
-
-# HTTP client
-aiohttp>=3.9.0
-httpx>=0.25.0
-flask
-aiohttp
-aiosqlite
-asyncio-throttle
-cryptography
-httpx
-pyaes
-python-dotenv
-python-telegram-bot
-telethon
+Pillow==10.4.0
+emoji==2.12.1
